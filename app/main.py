@@ -3,6 +3,11 @@
 启动后默认监听 8000 端口，交互式文档位于 /docs。
 每个写请求使用独立连接 + BEGIN IMMEDIATE 事务，天然串行化，
 并发裁决不会超发（见 app/database.py 与 app/quota.py）。
+
+管理写接口（PUT /policies、POST /policies/rollback、POST /policy-changes、
+DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
+（X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
+所有 GET、POST /decide 裁决与撤销接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from typing import Iterator
 from fastapi import Depends, FastAPI, Query
 
 from . import quota
+from .auth import AdminPrincipal, require_admin, reserve_nonce
 from .database import connect, init_db, write_tx
 from .schemas import (
     BucketOut,
@@ -45,8 +51,11 @@ app = FastAPI(
         "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
         "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用；"
         "策略变更追加不可变版本记录，支持历史查询与同事务回滚。"
+        "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
+        " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
+        "GET、裁决与撤销接口无需认证。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -72,11 +81,25 @@ def get_policies(conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
     return quota.list_policies(conn)
 
 
-@app.put("/policies", response_model=PolicyOut, tags=["策略"])
+@app.put(
+    "/policies",
+    response_model=PolicyOut,
+    tags=["策略"],
+    responses={
+        401: {"description": "缺少/无效的 HMAC 签名，或时间戳偏离超过 300 秒"},
+        409: {"description": "nonce 在同一 key 下 300 秒内重用；或该策略存在 pending 变更"},
+        503: {"description": "服务端未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET"},
+    },
+)
 def put_policy(
-    body: PolicyIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+    admin: AdminPrincipal = Depends(require_admin),
 ) -> dict:
+    # nonce 登记与业务写入在同一 BEGIN IMMEDIATE 事务：业务失败回滚时
+    # nonce 不被占用；提交成功后 300 秒内同 key 同 nonce 一律 409
     with write_tx(conn):
+        reserve_nonce(conn, admin.key_id, admin.nonce)
         return quota.upsert_policy(
             conn,
             scope=body.scope,
@@ -110,12 +133,16 @@ def get_policy_history(
     response_model=PolicyVersionOut,
     tags=["策略版本审计"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 签名，或时间戳偏离超过 300 秒"},
         404: {"description": "目标策略或版本不存在"},
-        409: {"description": "该策略存在待生效（pending）的定时变更"},
+        409: {"description": "nonce 重用；或该策略存在待生效（pending）的定时变更"},
+        503: {"description": "服务端未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET"},
     },
 )
 def post_policy_rollback(
-    body: PolicyRollbackIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyRollbackIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+    admin: AdminPrincipal = Depends(require_admin),
 ) -> dict:
     """在同一写事务内把策略恢复到指定历史版本。
 
@@ -123,6 +150,7 @@ def post_policy_rollback(
     恢复成功会追加一条 source=rollback 的新版本（版本号继续递增）。
     """
     with write_tx(conn):
+        reserve_nonce(conn, admin.key_id, admin.nonce)
         return quota.rollback_policy(
             conn,
             scope=body.scope,
@@ -140,12 +168,16 @@ def post_policy_rollback(
     response_model=PolicyChangeOut,
     tags=["策略定时切换"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 签名，或时间戳偏离超过 300 秒"},
         404: {"description": "目标策略不存在"},
-        409: {"description": "change_id 已存在，或同一策略已有待生效变更"},
+        409: {"description": "nonce 重用；或 change_id 已存在；或同一策略已有待生效变更"},
+        503: {"description": "服务端未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET"},
     },
 )
 def post_policy_change(
-    body: PolicyChangeIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyChangeIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+    admin: AdminPrincipal = Depends(require_admin),
 ) -> dict:
     """为已存在的策略登记一条未来生效的定时切换。
 
@@ -154,6 +186,7 @@ def post_policy_change(
     BEGIN IMMEDIATE 事务内先应用变更，再执行裁决。
     """
     with write_tx(conn):
+        reserve_nonce(conn, admin.key_id, admin.nonce)
         return quota.create_policy_change(
             conn,
             change_id=body.change_id,
@@ -206,15 +239,20 @@ def get_policy_change(
     response_model=PolicyChangeOut,
     tags=["策略定时切换"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 签名，或时间戳偏离超过 300 秒"},
         404: {"description": "变更不存在"},
-        409: {"description": "变更已生效或已到生效时刻，无法取消"},
+        409: {"description": "nonce 重用；或变更已生效或已到生效时刻，无法取消"},
+        503: {"description": "服务端未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET"},
     },
 )
 def delete_policy_change(
-    change_id: str, conn: sqlite3.Connection = Depends(get_conn)
+    change_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+    admin: AdminPrincipal = Depends(require_admin),
 ) -> dict:
     """在生效前取消一条 pending 变更；重复取消幂等。"""
     with write_tx(conn):
+        reserve_nonce(conn, admin.key_id, admin.nonce)
         return quota.cancel_policy_change(conn, change_id)
 
 

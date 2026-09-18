@@ -135,6 +135,22 @@ BEGIN
     SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 DELETE');
 END;
 
+-- 管理写接口（PUT /policies、POST /policies/rollback、
+-- POST /policy-changes、DELETE /policy-changes/{id}）的 HMAC 防重放 nonce。
+-- 与 key_id 联合唯一：同一 key 在保留窗口（expires_at，300 秒）内重用 -> 409；
+-- 过期行在每次认证写入前于同一事务内清理。登记必须与业务写入同事务提交，
+-- 业务失败回滚时 nonce 行一并撤销（见 app/auth.py reserve_nonce）。
+CREATE TABLE IF NOT EXISTS admin_nonces (
+    key_id     TEXT NOT NULL,
+    nonce      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (key_id, nonce)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_admin_nonces_expires
+ON admin_nonces (expires_at);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

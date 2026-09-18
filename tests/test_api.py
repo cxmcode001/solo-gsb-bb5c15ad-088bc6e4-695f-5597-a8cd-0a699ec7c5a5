@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+
+ADMIN_KEY_ID = "test-admin-key"
+ADMIN_HMAC_SECRET = "test-admin-secret"
 
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch) -> TestClient:
     db_file = tmp_path / "test.db"
     monkeypatch.setenv("QUOTA_DB_PATH", str(db_file))
+    monkeypatch.setenv("ADMIN_KEY_ID", ADMIN_KEY_ID)
+    monkeypatch.setenv("ADMIN_HMAC_SECRET", ADMIN_HMAC_SECRET)
     # 延迟导入 app，确保它读到环境变量
     import importlib
 
@@ -29,6 +38,40 @@ def client(tmp_path, monkeypatch) -> TestClient:
 _UNSET = object()
 
 
+def sign_headers(method: str, target: str, body: bytes, *,
+                 key_id: str = ADMIN_KEY_ID, secret: str = ADMIN_HMAC_SECRET,
+                 timestamp: int | None = None, nonce: str | None = None) -> dict:
+    """按服务端同样的规则构造管理写请求的四个签名头。"""
+    ts = str(int(time.time()) if timestamp is None else timestamp)
+    nonce = nonce or f"nonce-{time.time_ns()}-{threading.get_ident()}"
+    body_hash = hashlib.sha256(body).hexdigest()
+    signing = "\n".join([method, target, body_hash, ts, nonce]).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), signing, hashlib.sha256).hexdigest()
+    return {
+        "X-Key-Id": key_id,
+        "X-Timestamp": ts,
+        "X-Nonce": nonce,
+        "X-Signature": signature,
+    }
+
+
+def admin_call(client, method, target, payload=None, *, raw_body=None,
+               headers=None, **sign_kwargs):
+    """发起带 HMAC 签名的管理写请求；签名覆盖实际发出的字节。
+
+    sign_kwargs 可覆盖 nonce / timestamp / key_id / secret（用于重放测试）。
+    """
+    if raw_body is None:
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+    else:
+        body = raw_body
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(sign_headers(method, target, body, **sign_kwargs))
+    if headers:
+        hdrs.update(headers)
+    return client.request(method, target, content=body, headers=hdrs)
+
+
 def put_policy(client, scope, capacity, refill_rate, tenant=None, route=None,
                threshold=_UNSET):
     body = {
@@ -40,7 +83,7 @@ def put_policy(client, scope, capacity, refill_rate, tenant=None, route=None,
     }
     if threshold is not _UNSET:
         body["low_balance_threshold"] = threshold
-    return client.put("/policies", json=body)
+    return admin_call(client, "PUT", "/policies", body)
 
 
 def _iso(dt: datetime) -> str:
@@ -62,13 +105,15 @@ def post_change(client, change_id, scope, capacity, refill_rate, *,
     }
     if threshold is not _UNSET:
         body["low_balance_threshold"] = threshold
-    return client.post("/policy-changes", json=body)
+    return admin_call(client, "POST", "/policy-changes", body)
 
 
 def rollback(client, scope, version, tenant=None, route=None):
-    return client.post(
+    return admin_call(
+        client,
+        "POST",
         "/policies/rollback",
-        json={
+        {
             "scope": scope,
             "tenant_id": tenant,
             "route_id": route,
@@ -554,10 +599,10 @@ def test_policy_change_lifecycle_and_conflicts(client):
     assert client.get("/policy-changes/missing").status_code == 404
 
     # 取消后：PUT 恢复、可再提交；重复取消幂等
-    r = client.delete("/policy-changes/ch1")
+    r = admin_call(client, "DELETE", "/policy-changes/ch1")
     assert r.status_code == 200 and r.json()["status"] == "cancelled"
     assert r.json()["cancelled_at"]
-    assert client.delete("/policy-changes/ch1").json()["status"] == "cancelled"
+    assert admin_call(client, "DELETE", "/policy-changes/ch1").json()["status"] == "cancelled"
     assert put_policy(client, "global", 200, 0).status_code == 200
     r = post_change(client, "ch1b", "global", 50, 10, effective_in=3600)
     assert r.status_code == 200
@@ -577,14 +622,14 @@ def test_policy_change_validation(client):
     r = post_change(client, "x", "global", 10, 0, threshold=11,
                     effective_in=10)
     assert r.status_code == 422
-    # effective_at 必须是未来
-    r = client.post("/policy-changes", json={
+    # effective_at 必须是未来（带签名通过认证后才到 422 校验）
+    r = admin_call(client, "POST", "/policy-changes", {
         "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
         "effective_at": _iso(datetime.now(timezone.utc) - timedelta(seconds=5)),
     })
     assert r.status_code == 422
     # effective_at 必须显式带时区
-    r = client.post("/policy-changes", json={
+    r = admin_call(client, "POST", "/policy-changes", {
         "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
         "effective_at": "2026-10-01T00:00:00",
     })
@@ -626,7 +671,7 @@ def test_change_application_scales_balance_proportionally(client):
     # applied 后可以提交新的 pending，也可以直接 PUT
     assert post_change(client, "ch2", "global", 10, 0,
                        effective_in=3600).status_code == 200
-    assert client.delete("/policy-changes/ch2").status_code == 200
+    assert admin_call(client, "DELETE", "/policy-changes/ch2").status_code == 200
     assert put_policy(client, "global", 50, 0).status_code == 200
 
 
@@ -789,17 +834,17 @@ def test_revoke_applies_due_change_before_refund(client):
 def test_cancel_after_effective_time_conflicts(client):
     put_policy(client, "global", 100, 0)
     post_change(client, "ch1", "global", 50, 0, effective_in=1)
-    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert admin_call(client, "DELETE", "/policy-changes/ch1").status_code == 200
     # 取消后已无 pending，可以重新提交一条
     post_change(client, "ch2", "global", 50, 0, effective_in=1)
 
     import time
     time.sleep(1.2)
     # 到期后取消 -> 409；触发一次裁决令其应用
-    assert client.delete("/policy-changes/ch2").status_code == 409
+    assert admin_call(client, "DELETE", "/policy-changes/ch2").status_code == 409
     client.post("/decide", json={"request_id": "d1", "cost": 1})
     assert client.get("/policy-changes/ch2").json()["status"] == "applied"
-    assert client.delete("/policy-changes/ch2").status_code == 409
+    assert admin_call(client, "DELETE", "/policy-changes/ch2").status_code == 409
 
 
 # ------------------------------------------------------------ 策略版本审计与回滚
@@ -939,7 +984,7 @@ def test_rollblock_blocked_by_pending_change(client):
     assert p["capacity"] == 50.0
     assert [v["version"] for v in history(client, "global").json()] == [2, 1]
     # 取消后可以回滚
-    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert admin_call(client, "DELETE", "/policy-changes/ch1").status_code == 200
     assert rollback(client, "global", 1).status_code == 200
 
 
@@ -1060,3 +1105,336 @@ def test_policy_versions_are_append_only(tmp_path):
         assert [(r[0], r[1]) for r in rows] == [(1, 10.0), (2, 11.0)]
     finally:
         conn.close()
+
+# ------------------------------------------------------------ 管理写接口 HMAC 防重放认证
+
+
+def test_admin_writes_require_signature(client):
+    # 四个管理写接口不带签名头一律 401
+    assert client.put("/policies", json={
+        "scope": "global", "capacity": 10, "refill_rate": 0}).status_code == 401
+    assert client.post("/policies/rollback", json={
+        "scope": "global", "version": 1}).status_code == 401
+    assert client.post("/policy-changes", json={
+        "change_id": "c", "scope": "global", "capacity": 1, "refill_rate": 0,
+        "effective_at": _iso(datetime.now(timezone.utc) + timedelta(hours=1)),
+    }).status_code == 401
+    assert client.delete("/policy-changes/nope").status_code == 401
+
+
+def test_get_decide_and_revoke_remain_anonymous(client):
+    # GET 全部匿名
+    assert client.get("/health").status_code == 200
+    assert client.get("/policies").status_code == 200
+    assert client.get("/policy-changes").status_code == 200
+    assert client.get("/buckets").status_code == 200
+    assert client.get("/events").status_code == 200
+    # 裁决 / 撤销匿名（404 说明已经穿过认证层到达业务）
+    assert client.post("/decide", json={
+        "request_id": "d", "cost": 1}).status_code == 404
+    assert client.post("/decide/nope/revoke").status_code == 404
+
+
+def test_signed_put_succeeds(client):
+    r = admin_call(client, "PUT", "/policies",
+                   {"scope": "global", "capacity": 10, "refill_rate": 1})
+    assert r.status_code == 200
+    assert r.json()["capacity"] == 10.0
+
+
+def test_missing_or_partial_headers_401(client):
+    body = json.dumps({"scope": "global", "capacity": 10, "refill_rate": 0}).encode()
+    full = sign_headers("PUT", "/policies", body)
+    for drop in ("X-Key-Id", "X-Timestamp", "X-Nonce", "X-Signature"):
+        hdrs = {k: v for k, v in full.items() if k != drop}
+        hdrs["Content-Type"] = "application/json"
+        r = client.request("PUT", "/policies", content=body, headers=hdrs)
+        assert r.status_code == 401, drop
+
+
+def test_wrong_key_id_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    r = admin_call(client, "PUT", "/policies", raw_body=body,
+                   key_id="wrong-key")
+    assert r.status_code == 401
+
+
+def test_wrong_secret_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    r = admin_call(client, "PUT", "/policies", raw_body=body,
+                   secret="a-different-secret")
+    assert r.status_code == 401
+
+
+def test_bad_signature_format_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    # 大写十六进制不合规（签名值必须是小写 hex）
+    hdrs = sign_headers("PUT", "/policies", body)
+    hdrs["X-Signature"] = hdrs["X-Signature"].upper()
+    r = client.request("PUT", "/policies", content=body, headers=hdrs)
+    assert r.status_code == 401
+    # 长度不足 / 非 hex
+    for bad in ("abc", "z" * 64):
+        hdrs2 = sign_headers("PUT", "/policies", body)
+        hdrs2["X-Signature"] = bad
+        r = client.request("PUT", "/policies", content=body, headers=hdrs2)
+        assert r.status_code == 401
+
+
+def test_tampered_body_or_method_or_path_401(client):
+    body = json.dumps({"scope": "global", "capacity": 10, "refill_rate": 0}).encode()
+    # 签名覆盖的 body 与实际 body 不一致
+    hdrs = sign_headers("PUT", "/policies", body)
+    tampered = body.replace(b'"capacity": 10', b'"capacity": 11')
+    assert tampered != body
+    r = client.request("PUT", "/policies", content=tampered, headers=hdrs)
+    assert r.status_code == 401
+
+    # 用另一路径的签名打到 /policies
+    hdrs = sign_headers("PUT", "/other", body)
+    r = client.request("PUT", "/policies", content=body, headers=hdrs)
+    assert r.status_code == 401
+
+    # 用 GET 的方法签名发 PUT
+    hdrs = sign_headers("GET", "/policies", body)
+    r = client.request("PUT", "/policies", content=body, headers=hdrs)
+    assert r.status_code == 401
+
+
+def test_query_string_is_part_of_signature(client):
+    # 路径含查询串时必须把「原始路径及查询串」整体纳入签名
+    target = "/policies/history?scope=global"
+    # GET 本来就免认证；这里只验证：带查询串计算的签名服务端可复现。
+    # 借 DELETE（空 body）在一个不存在的 change_id 上验证：
+    # 查询串不参与该路径，因此用 404（业务）vs 401（签名错）区分
+    target_del = "/policy-changes/c1?x=1"
+    body = b""
+    r = admin_call(client, "DELETE", target_del)
+    assert r.status_code == 404  # 签名正确（含 ?x=1），只是变更不存在
+
+    # 签名时漏算查询串 -> 401
+    hdrs = sign_headers("DELETE", "/policy-changes/c1", body)
+    r = client.request("DELETE", target_del, content=body, headers=hdrs)
+    assert r.status_code == 401
+
+    # 签名时查询串错误 -> 401
+    hdrs = sign_headers("DELETE", "/policy-changes/c1?x=2", body)
+    r = client.request("DELETE", target_del, content=body, headers=hdrs)
+    assert r.status_code == 401
+
+
+def test_timestamp_outside_window_401(client):
+    now = int(time.time())
+    for offset in (-301, 301, 10_000, -10_000):
+        r = admin_call(
+            client, "PUT", "/policies",
+            {"scope": "global", "capacity": 10, "refill_rate": 0},
+            timestamp=now + offset,
+        )
+        assert r.status_code == 401, offset
+
+
+def test_timestamp_boundary_accepted(client):
+    now = int(time.time())
+    # 用 ±299 避开 ±300 边界上的毫秒级时钟/调度抖动
+    for offset in (-299, 0, 299):
+        r = admin_call(
+            client, "PUT", "/policies",
+            {"scope": "global", "capacity": 10, "refill_rate": 0},
+            timestamp=now + offset, nonce=f"n-boundary-{offset}",
+        )
+        assert r.status_code == 200, (offset, r.status_code)
+
+
+def test_timestamp_must_be_unix_seconds_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    # 非数字 / 小数：先正常签名，再把时间戳头替换成非法值
+    for bad in ("abc", "1700000000.5", "-12", ""):
+        hdrs = sign_headers("PUT", "/policies", body)
+        hdrs["X-Timestamp"] = bad
+        r = client.request("PUT", "/policies", content=body, headers=hdrs)
+        assert r.status_code == 401, bad
+    # 11 位数字能过格式检查但远超 ±300 秒窗口
+    r = admin_call(
+        client, "PUT", "/policies",
+        {"scope": "global", "capacity": 10, "refill_rate": 0},
+        timestamp=17_000_000_000,
+    )
+    assert r.status_code == 401
+
+
+def test_nonce_reuse_same_key_409(client):
+    body = {"scope": "global", "capacity": 10, "refill_rate": 0}
+    r = admin_call(client, "PUT", "/policies", body, nonce="fixed-nonce")
+    assert r.status_code == 200
+    # 完全相同的请求 + 相同 nonce：时间戳仍新鲜 -> 409（不是 401）
+    r = admin_call(client, "PUT", "/policies", body, nonce="fixed-nonce")
+    assert r.status_code == 409
+    # 换一个 nonce 即可成功
+    r = admin_call(client, "PUT", "/policies", body, nonce="another-nonce")
+    assert r.status_code == 200
+
+
+def test_nonce_reuse_after_expiry_is_allowed(client, tmp_path, monkeypatch):
+    """nonce 只在 300 秒窗口内防重放：过期行清理后同一 nonce 可再用。"""
+    from app import database
+
+    body = {"scope": "global", "capacity": 10, "refill_rate": 0}
+    r = admin_call(client, "PUT", "/policies", body, nonce="expiring-nonce")
+    assert r.status_code == 200
+
+    # 直接把该 nonce 的 expires_at 改成已过期
+    conn = database.connect()
+    try:
+        conn.execute(
+            "UPDATE admin_nonces SET expires_at=? WHERE nonce='expiring-nonce'",
+            (int(time.time()) - 1,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 新请求先清理过期行再插入，同一 nonce 可重新使用
+    r = admin_call(client, "PUT", "/policies", body, nonce="expiring-nonce")
+    assert r.status_code == 200
+
+
+def test_same_nonce_under_different_key_is_allowed(client, monkeypatch):
+    # 先用配置中的 key 成功一次
+    body = {"scope": "global", "capacity": 10, "refill_rate": 0}
+    r = admin_call(client, "PUT", "/policies", body, nonce="shared-nonce")
+    assert r.status_code == 200
+    # 另一把 key 使用相同 nonce 字符串：key 不匹配 -> 401（先验 key）
+    r = admin_call(client, "PUT", "/policies", body,
+                   key_id="other-key", secret="whatever", nonce="shared-nonce")
+    assert r.status_code == 401
+    # 同一 nonce 在不同 (key, nonce) 组合下隔离：直接验证表结构层面的
+    # 组合唯一——用 reserve_nonce 以另一 key 登记不应冲突
+    import sqlite3
+    from app import database
+    from app.auth import reserve_nonce
+    conn = database.connect()
+    try:
+        with database.write_tx(conn):
+            reserve_nonce(conn, "other-key", "shared-nonce")
+        rows = conn.execute(
+            "SELECT key_id FROM admin_nonces WHERE nonce='shared-nonce'"
+        ).fetchall()
+        assert {r[0] for r in rows} == {ADMIN_KEY_ID, "other-key"}
+    finally:
+        conn.close()
+
+
+def test_business_failure_does_not_consume_nonce(client):
+    # 业务失败（阈值越界 -> 422）回滚事务，nonce 不应被占用：
+    # 修正载荷后用同一 nonce 重试应成功
+    bad = {"scope": "global", "capacity": 10, "refill_rate": 0,
+           "low_balance_threshold": 11}
+    r = admin_call(client, "PUT", "/policies", bad, nonce="n-retry")
+    assert r.status_code == 422
+
+    good = {"scope": "global", "capacity": 10, "refill_rate": 0,
+            "low_balance_threshold": 1}
+    r = admin_call(client, "PUT", "/policies", good, nonce="n-retry")
+    assert r.status_code == 200
+
+
+def test_404_business_failure_does_not_consume_nonce(client):
+    # DELETE 不存在的变更 -> 404 回滚；同一 nonce 随后可成功用于合法取消
+    r = admin_call(client, "DELETE", "/policy-changes/missing", nonce="n-del")
+    assert r.status_code == 404
+
+    put_policy(client, "global", 10, 0)
+    post_change(client, "ch1", "global", 5, 0, effective_in=3600)
+    r = admin_call(client, "DELETE", "/policy-changes/ch1", nonce="n-del")
+    assert r.status_code == 200
+
+
+def test_duplicate_nonce_rejected_before_business_validation(client):
+    # 先用一个合法请求占用 nonce
+    body = {"scope": "global", "capacity": 10, "refill_rate": 0}
+    assert admin_call(client, "PUT", "/policies", body,
+                      nonce="n-dup").status_code == 200
+    # 即使本次载荷业务上非法（阈值越界），也先撞 nonce -> 409 而非 422
+    bad = {"scope": "global", "capacity": 10, "refill_rate": 0,
+           "low_balance_threshold": 99}
+    r = admin_call(client, "PUT", "/policies", bad, nonce="n-dup")
+    assert r.status_code == 409
+
+
+def test_replay_identical_signed_request_is_409(client):
+    # 完整重放一个已成功的管理请求（含相同签名头与新鲜时间戳）也不能两次生效：
+    # 这里固定 nonce，仅刷新时间戳仍因 nonce 已登记而 409
+    body = {"scope": "global", "capacity": 10, "refill_rate": 0}
+    nonce = "n-once"
+    assert admin_call(client, "PUT", "/policies", body, nonce=nonce).status_code == 200
+    # 同签名串重放（时间戳也照旧）：nonce 已存在 -> 409
+    ts = str(int(time.time()))
+    body_b = json.dumps(body).encode()
+    hdrs = sign_headers("PUT", "/policies", body_b, timestamp=ts, nonce=nonce)
+    hdrs["Content-Type"] = "application/json"
+    r = client.request("PUT", "/policies", content=body_b, headers=hdrs)
+    assert r.status_code == 409
+
+
+def test_empty_body_delete_uses_sha256_of_empty(client):
+    put_policy(client, "global", 10, 0)
+    post_change(client, "ch1", "global", 5, 0, effective_in=3600)
+    # DELETE 无请求体：签名时请求体摘要取 sha256(b"")
+    r = admin_call(client, "DELETE", "/policy-changes/ch1", nonce="n-empty")
+    assert r.status_code == 200
+    # 用非空 body 的摘要给空 body 请求签名 -> 401
+    ts = str(int(time.time()))
+    wrong_hash = hashlib.sha256(b"x").hexdigest()
+    signing = "\n".join(
+        ["DELETE", "/policy-changes/ch1", wrong_hash, ts, "n-empty2"]
+    ).encode()
+    sig = hmac.new(ADMIN_HMAC_SECRET.encode(), signing, hashlib.sha256).hexdigest()
+    hdrs = {
+        "X-Key-Id": ADMIN_KEY_ID, "X-Timestamp": ts,
+        "X-Nonce": "n-empty2", "X-Signature": sig,
+    }
+    r = client.request("DELETE", "/policy-changes/ch1", content=b"", headers=hdrs)
+    assert r.status_code == 401
+
+
+def test_all_four_admin_endpoints_have_nonce_rows(client):
+    put_policy(client, "global", 10, 0)
+    post_change(client, "ch1", "global", 5, 0, effective_in=3600)
+    admin_call(client, "DELETE", "/policy-changes/ch1", nonce="n1")
+    # ch1 已取消（无 pending），回滚才合法
+    rollback(client, "global", 1)
+    post_change(client, "ch2", "global", 5, 0, effective_in=3600)
+    admin_call(client, "DELETE", "/policy-changes/ch2", nonce="n2")
+
+    from app import database
+    conn = database.connect()
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM admin_nonces").fetchone()[0]
+        # PUT policy + create ch1 + delete ch1 + rollback + create ch2 + delete ch2
+        assert n == 6
+    finally:
+        conn.close()
+
+
+def test_unconfigured_admin_credentials_503(tmp_path, monkeypatch):
+    """未配置 ADMIN_KEY_ID / ADMIN_HMAC_SECRET 时管理接口 fail-closed 503。"""
+    import importlib
+    from fastapi.testclient import TestClient
+    from app import database, main
+
+    db_file = tmp_path / "noconf.db"
+    monkeypatch.setenv("QUOTA_DB_PATH", str(db_file))
+    monkeypatch.delenv("ADMIN_KEY_ID", raising=False)
+    monkeypatch.delenv("ADMIN_HMAC_SECRET", raising=False)
+    importlib.reload(database)
+    importlib.reload(main)
+    database.init_db(str(db_file))
+    with TestClient(main.app) as c:
+        # 免认证接口不受影响
+        assert c.get("/health").status_code == 200
+        assert c.post("/decide", json={"request_id": "d", "cost": 1}).status_code == 404
+        # 管理接口 503（而非放行）
+        r = c.put("/policies", json={
+            "scope": "global", "capacity": 1, "refill_rate": 0})
+        assert r.status_code == 503

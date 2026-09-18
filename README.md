@@ -52,6 +52,18 @@
 - **并发不超发**：SQLite 处于 WAL 模式，写事务一律 `BEGIN IMMEDIATE` 立即加写锁，
   配合 `busy_timeout=30s` 让并发写者排队，读-改-写序列天然串行化。
   单进程多线程、多进程（多个实例共享同一数据库文件）下均不会超发。
+- **管理写接口 HMAC-SHA256 防重放认证**：仅保护四个管理写接口——
+  `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
+  `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
+  （定时变更取消）。**所有 GET、`POST /decide` 裁决与撤销接口保持原样、无需认证**。
+  客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
+  签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
+  签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
+  做常量时间比较；时间戳偏离当前时间超过 **300 秒**或签名/key 不符返回 **401**。
+  通过认证的 `(key_id, nonce)` 在 SQLite 中保留 **300 秒**，同一 key 重用 nonce
+  返回 **409**；nonce 登记与业务写入在**同一个 `BEGIN IMMEDIATE` 事务**中提交，
+  业务失败回滚不会占用 nonce（可用同一 nonce 修正后重试）。详见下文
+  [管理写接口签名认证](#管理写接口签名认证) 一节。
 
 ## 一条命令启动（需要 Docker + Compose）
 
@@ -60,6 +72,29 @@ docker compose up --build
 # 后台运行：
 docker compose up --build -d
 ```
+
+Compose 已内置**可直接启动的开发默认凭据**（`ADMIN_KEY_ID=admin-key-1`、
+`ADMIN_HMAC_SECRET=change-me-please-use-openssl-rand-hex-32`），因此无需任何准备
+即可跑通；**生产部署必须覆盖为自己的高强度随机密钥**，启动前在 shell 导出或通过
+环境文件注入即可：
+
+```bash
+# 方式一：导出环境变量后再启动（compose 中的 ${...:-默认值} 会优先采用）
+export ADMIN_KEY_ID="your-key-id"
+export ADMIN_HMAC_SECRET="$(openssl rand -hex 32)"
+docker compose up --build -d
+
+# 方式二：使用 .env 文件（docker compose 会自动读取当前目录的 .env）
+cat > .env <<'ENV'
+ADMIN_KEY_ID=your-key-id
+ADMIN_HMAC_SECRET=replace-with-openssl-rand-hex-32-output
+ENV
+docker compose up --build -d
+```
+
+> 若服务端**未配置** `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`（两者任一为空），
+> 四个管理写接口以 **503** 显式拒绝（fail-closed，绝不放行）；
+> GET / 裁决 / 撤销接口不受影响。
 
 服务监听 **8000 端口**：
 
@@ -71,19 +106,152 @@ docker compose up --build -d
 SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`），
 `docker compose down` 不会删除；如需清空：`docker compose down -v`。
 
+### 配置项（环境变量）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ADMIN_KEY_ID` | `admin-key-1`（仅 compose 内置默认） | 管理写接口期望的 `X-Key-Id`；与 `X-Signature` 均做常量时间比较 |
+| `ADMIN_HMAC_SECRET` | `change-me-...`（仅 compose 内置默认） | HMAC-SHA256 密钥，生产请用 `openssl rand -hex 32` 生成 |
+| `QUOTA_DB_PATH` | `/data/quota.db` | SQLite 数据库文件路径 |
+
+签名相关常量（服务端固定）：时间戳窗口 **300 秒**、nonce 保留 **300 秒**。
+
+## 管理写接口签名认证
+
+需要认证的接口（其余接口一律免认证）：
+
+| 方法 | 路径 |
+| --- | --- |
+| `PUT` | `/policies` |
+| `POST` | `/policies/rollback` |
+| `POST` | `/policy-changes` |
+| `DELETE` | `/policy-changes/{change_id}` |
+
+### 请求头
+
+| 头 | 含义 |
+| --- | --- |
+| `X-Key-Id` | 密钥标识，必须等于服务端 `ADMIN_KEY_ID` |
+| `X-Timestamp` | 请求时刻的 **Unix 秒**（整数）；与服务器时间偏差超过 300 秒返回 401 |
+| `X-Nonce` | 每次请求唯一的随机串；同一 `X-Key-Id` 在 300 秒内重用返回 409 |
+| `X-Signature` | HMAC-SHA256 签名，**小写**十六进制（64 个字符） |
+
+### 签名原文
+
+共 5 段，以换行符 `\n` 分隔（**末尾不带换行**）：
+
+```
+<METHOD>
+<原始路径及查询串>
+<请求体 SHA-256 的小写十六进制>
+<X-Timestamp>
+<X-Nonce>
+```
+
+- **METHOD**：大写 HTTP 方法，如 `PUT` / `POST` / `DELETE`。
+- **原始路径及查询串**：请求行中的 path 与 query 原样拼接（未做 URL 解码）。
+  有查询串时形如 `/policy-changes/c1?x=1`，无查询串时不带 `?`
+  （如 `/policies`）。百分号编码必须与实际请求完全一致。
+- **请求体摘要**：`sha256(原始请求体字节)` 的小写十六进制；
+  `DELETE` 无请求体时取空字节的摘要：
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`。
+- **签名**：`HMAC_SHA256(ADMIN_HMAC_SECRET, 签名原文)`，输出**小写**十六进制。
+
+### 签名与发送示例（bash + curl + openssl）
+
+```bash
+KEY_ID="admin-key-1"
+SECRET="change-me-please-use-openssl-rand-hex-32"
+BASE="http://localhost:8000"
+
+# 1) 准备请求体与四个头
+BODY='{"scope":"global","capacity":10,"refill_rate":1}'
+METHOD="PUT"
+TARGET="/policies"                       # 有查询串时连查询串一起，如 /x?a=1
+TS="$(date +%s)"                          # Unix 秒
+NONCE="$(openssl rand -hex 16)"           # 一次性随机串
+BODY_HASH="$(printf '%s' "$BODY" | openssl dgst -sha256 | awk '{print $2}')"
+
+# 2) 组装签名原文并计算 HMAC（5 段，恰好 4 个换行）
+SIGNING="$(printf '%s\n%s\n%s\n%s\n%s' \
+  "$METHOD" "$TARGET" "$BODY_HASH" "$TS" "$NONCE")"
+SIG="$(printf '%s' "$SIGNING" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+
+# 3) 发送（签名覆盖的 TARGET 必须与实际 URL 的路径+查询串逐字节一致）
+curl -s -X PUT "$BASE$TARGET" \
+  -H 'Content-Type: application/json' \
+  -H "X-Key-Id: $KEY_ID" \
+  -H "X-Timestamp: $TS" \
+  -H "X-Nonce: $NONCE" \
+  -H "X-Signature: $SIG" \
+  -d "$BODY"
+```
+
+Python 版本（等价实现，`DELETE` 时把 `body` 置为 `b""`）：
+
+```python
+import hashlib, hmac, time, secrets, urllib.request, json
+
+key_id, secret = "admin-key-1", b"change-me-please-use-openssl-rand-hex-32"
+method, target = "PUT", "/policies"
+body = json.dumps({"scope": "global", "capacity": 10, "refill_rate": 1}).encode()
+ts = str(int(time.time()))
+nonce = secrets.token_hex(16)
+body_hash = hashlib.sha256(body).hexdigest()
+signing = "\n".join([method, target, body_hash, ts, nonce]).encode()
+signature = hmac.new(secret, signing, hashlib.sha256).hexdigest()  # 小写 hex
+
+req = urllib.request.Request(
+    f"http://localhost:8000{target}", data=body, method=method,
+    headers={
+        "Content-Type": "application/json",
+        "X-Key-Id": key_id,
+        "X-Timestamp": ts,
+        "X-Nonce": nonce,
+        "X-Signature": signature,
+    },
+)
+print(urllib.request.urlopen(req).read().decode())
+```
+
+### 状态码与防重放语义
+
+| 状态码 | 触发条件 |
+| --- | --- |
+| `200` | 签名有效、nonce 首次使用，业务成功 |
+| `401` | 缺少签名头；`X-Key-Id` 不符；时间戳非 Unix 秒或偏离 > 300 秒；`X-Signature` 非 64 位小写 hex；签名不匹配（方法/路径/查询串/请求体摘要/时间戳/nonce 任一被改） |
+| `409` | 同一 `X-Key-Id` 在 300 秒内重用 `X-Nonce`（业务自身的 409，如 pending 变更冲突，含义见各接口说明） |
+| `503` | 服务端未配置 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`（fail-closed） |
+
+要点：
+
+- **业务失败不占用 nonce**：nonce 的登记与业务写入处于同一个
+  `BEGIN IMMEDIATE` 事务。若业务返回 4xx/5xx（如阈值越界 422、策略不存在 404、
+  pending 冲突 409），事务整体回滚，nonce 一并撤销，客户端修正请求后
+  **可用同一 nonce 重试**。只有随业务成功一起提交的 nonce 才在 300 秒内防重放。
+- **nonce 按 key 隔离**：唯一约束是 `(key_id, nonce)`，不同 key 使用相同 nonce
+  字符串互不影响；过期行（超过 300 秒）在下一次认证写入时自动清理，清理后
+  同一 nonce 可再次使用。
+- 防篡改同时覆盖**查询串**：`/policies/history?scope=global` 等路径若出现在
+  被保护接口上，必须把 `?scope=global` 原样纳入第二段。
+- 时钟校准请用 NTP；300 秒窗口用于吸收客户端与服务器之间的正常时钟偏差。
+
 ## API 一览
+
+> 🔐 = 管理写接口，需要 HMAC-SHA256 签名（见
+> [管理写接口签名认证](#管理写接口签名认证)）；其余接口免认证。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET`  | `/health` | 健康检查 |
 | `GET`  | `/policies` | 列出全部策略 |
-| `PUT`  | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert）；该策略有 pending 变更时返回 409；成功后追加一条 `put` 版本 |
+| `PUT` 🔐 | `/policies` | 创建/更新一层策略（按 scope+tenant_id+route_id 幂等 upsert）；该策略有 pending 变更时返回 409；成功后追加一条 `put` 版本 |
 | `GET`  | `/policies/history` | 按 scope/tenant_id/route_id 查询单策略的不可变版本历史（新版本在前） |
-| `POST` | `/policies/rollback` | 在同一写事务内把策略恢复到指定历史版本并追加 `rollback` 版本；有 pending 变更时 409，未知策略/版本 404 |
-| `POST` | `/policy-changes` | 为已存在的策略提交一条未来生效的定时切换 |
+| `POST` 🔐 | `/policies/rollback` | 在同一写事务内把策略恢复到指定历史版本并追加 `rollback` 版本；有 pending 变更时 409，未知策略/版本 404 |
+| `POST` 🔐 | `/policy-changes` | 为已存在的策略提交一条未来生效的定时切换 |
 | `GET`  | `/policy-changes` | 列出定时变更（可按 `status` / 策略键过滤） |
 | `GET`  | `/policy-changes/{change_id}` | 查询单条定时变更 |
-| `DELETE` | `/policy-changes/{change_id}` | 在生效前取消待生效变更（重复取消幂等） |
+| `DELETE` 🔐 | `/policy-changes/{change_id}` | 在生效前取消待生效变更（重复取消幂等） |
 | `GET`  | `/buckets` | 查看所有已创建桶补充后的实时余额（只读，不落库） |
 | `POST` | `/decide` | 提交一次多级裁决（事务内先应用命中且到期的变更） |
 | `POST` | `/decide/{request_id}/revoke` | 撤销一次已通过的裁决（重复撤销幂等） |
@@ -192,23 +360,41 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 
 ## 示例请求
 
-### 1. 配置三级策略
+> 下文标记 🔐 的管理写接口需要签名头。先在 shell 定义下面的辅助函数
+> （依赖 `openssl`，签名规则见
+> [管理写接口签名认证](#管理写接口签名认证)）：
+>
+> ```bash
+> BASE="http://localhost:8000"
+> KEY_ID="admin-key-1"                                   # 与 compose 默认 ADMIN_KEY_ID 一致
+> SECRET="change-me-please-use-openssl-rand-hex-32"      # 与 compose 默认 ADMIN_HMAC_SECRET 一致
+>
+> # 用法：admin_curl <METHOD> <TARGET> [BODY]
+> admin_curl() {
+>   local m="$1" t="$2" body="${3:-}" ts nonce bh sig
+>   ts="$(date +%s)"; nonce="$(openssl rand -hex 16)"
+>   bh="$(printf '%s' "$body" | openssl dgst -sha256 | awk '{print $2}')"
+>   sig="$(printf '%s\n%s\n%s\n%s\n%s' "$m" "$t" "$bh" "$ts" "$nonce" \
+>          | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+>   curl -s -X "$m" "$BASE$t" -H 'Content-Type: application/json' \
+>     -H "X-Key-Id: $KEY_ID" -H "X-Timestamp: $ts" \
+>     -H "X-Nonce: $nonce" -H "X-Signature: $sig" ${body:+-d "$body"}
+> }
+> ```
+>
+> 裁决、撤销与所有 GET 仍然直接用普通 `curl`，无需任何头。
+
+### 1. 配置三级策略 🔐
 
 ```bash
 # 全局：容量 10，0.5 令牌/秒
-curl -s -X PUT http://localhost:8000/policies \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"global","capacity":10,"refill_rate":0.5}'
+admin_curl PUT /policies '{"scope":"global","capacity":10,"refill_rate":0.5}'
 
 # 租户 acme：容量 6，1 令牌/秒
-curl -s -X PUT http://localhost:8000/policies \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"tenant","tenant_id":"acme","capacity":6,"refill_rate":1}'
+admin_curl PUT /policies '{"scope":"tenant","tenant_id":"acme","capacity":6,"refill_rate":1}'
 
 # 路由（acme 的 /v1/search）：容量 4，2 令牌/秒
-curl -s -X PUT http://localhost:8000/policies \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"route","tenant_id":"acme","route_id":"/v1/search","capacity":4,"refill_rate":2}'
+admin_curl PUT /policies '{"scope":"route","tenant_id":"acme","route_id":"/v1/search","capacity":4,"refill_rate":2}'
 ```
 
 ### 2. 裁决（通过，三级桶同时扣 3）
@@ -298,9 +484,7 @@ curl -s http://localhost:8000/buckets
 
 ```bash
 # 给租户 acme 配置阈值 2：余额从 2 以上降到 2 或以下时产生事件
-curl -s -X PUT http://localhost:8000/policies \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"tenant","tenant_id":"acme","capacity":6,"refill_rate":1,"low_balance_threshold":2}'
+admin_curl PUT /policies '{"scope":"tenant","tenant_id":"acme","capacity":6,"refill_rate":1,"low_balance_threshold":2}'
 
 # 裁决通过，租户桶 6 -> 3：仍在阈值之上，无事件
 curl -s -X POST http://localhost:8000/decide \
@@ -349,22 +533,18 @@ curl -s -X POST http://localhost:8000/decide \
 
 # 提交一条 60 秒后生效的变更：容量 20、2 令牌/秒、低余额阈值 3
 # （effective_at 必须是未来 UTC 时间，这里用 date 动态生成）
-curl -s -X POST http://localhost:8000/policy-changes \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"change_id\":\"chg-1\",
-    \"scope\":\"global\",
-    \"capacity\":20,
-    \"refill_rate\":2,
-    \"low_balance_threshold\":3,
-    \"effective_at\":\"$(date -u -d '60 seconds' +%Y-%m-%dT%H:%M:%SZ)\"
-  }"
+admin_curl POST /policy-changes "{
+  \"change_id\":\"chg-1\",
+  \"scope\":\"global\",
+  \"capacity\":20,
+  \"refill_rate\":2,
+  \"low_balance_threshold\":3,
+  \"effective_at\":\"$(date -u -d '60 seconds' +%Y-%m-%dT%H:%M:%SZ)\"
+}"
 
-# 待生效期间直接 PUT 该策略 -> 409
-curl -i -X PUT http://localhost:8000/policies \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"global","capacity":100,"refill_rate":0}'
-# HTTP/1.1 409 Conflict：该策略存在待生效的定时变更 change_id='chg-1' ...
+# 待生效期间直接 PUT 该策略 -> 409（业务冲突；注意签名仍必须有效）
+admin_curl PUT /policies '{"scope":"global","capacity":100,"refill_rate":0}'
+# {"detail":"该策略存在待生效的定时变更 change_id='chg-1' ..."}
 
 # 同一策略再提交一条 pending -> 409；change_id 重复 -> 409
 # 目标策略不存在 -> 404；effective_at 已过期或不带时区 -> 422
@@ -373,7 +553,7 @@ curl -i -X PUT http://localhost:8000/policies \
 curl -s 'http://localhost:8000/policy-changes?status=pending'
 
 # 生效前取消（重复取消幂等；已生效或已到生效时刻再取消返回 409）
-curl -s -X DELETE http://localhost:8000/policy-changes/chg-1
+admin_curl DELETE /policy-changes/chg-1
 ```
 
 到期时刻**不需要任何后台动作**：60 秒后的第一次 `POST /decide` 会在同一事务内
@@ -457,12 +637,10 @@ curl -s 'http://localhost:8000/policies/history?scope=route&tenant_id=acme&route
 > `restored_from_version` 指向被恢复的版本）、`baseline`（老库升级时按当时
 > 策略补登的 version=1）。
 
-回滚到指定版本（恢复参数 + 桶补充后截断 + 追加新版本在同一写事务内完成）：
+回滚到指定版本（恢复参数 + 桶补充后截断 + 追加新版本在同一写事务内完成）🔐：
 
 ```bash
-curl -s -X POST http://localhost:8000/policies/rollback \
-  -H 'Content-Type: application/json' \
-  -d '{"scope":"global","version":1}'
+admin_curl POST /policies/rollback '{"scope":"global","version":1}'
 ```
 
 ```json
@@ -523,8 +701,14 @@ curl -s -X POST http://localhost:8000/policies/rollback \
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-QUOTA_DB_PATH=./quota.db .venv/bin/uvicorn app.main:app --reload --port 8000
+ADMIN_KEY_ID=dev-key \
+ADMIN_HMAC_SECRET=dev-secret \
+QUOTA_DB_PATH=./quota.db \
+  .venv/bin/uvicorn app.main:app --reload --port 8000
 ```
+
+> 不设置 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET` 时，四个管理写接口返回 503；
+> GET / 裁决 / 撤销仍可正常使用。
 
 运行测试（另需 `pip install pytest httpx`）：
 
@@ -545,18 +729,25 @@ QUOTA_DB_PATH=./quota.db .venv/bin/uvicorn app.main:app --reload --port 8000
 策略版本审计覆盖 PUT/定时生效/回滚三个来源的版本号单调递增、
 按策略键新到旧查询、老库 baseline 补登（含幂等）、回滚恢复参数并追加
 rollback 版本、桶先按当前策略补充再按目标容量截断、pending 409 与
-未知策略/版本 404。
+未知策略/版本 404；管理写接口 HMAC 认证覆盖：未签名/缺头/错 key/错密钥
+/错签名格式（非小写 hex）/篡改方法路径查询串或请求体一律 401、
+时间戳非 Unix 秒与 ±300 秒窗口、空 body（DELETE）取空串摘要、
+nonce 同 key 重用 409 与过期清理后可复用、按 key 隔离、
+业务失败（422/404）回滚不占用 nonce、nonce 冲突先于业务校验、
+查询串与百分号编码纳入签名、凭据未配置 fail-closed 503、
+以及 GET/裁决/撤销保持匿名。
 
 ## 项目结构
 
 ```
 app/
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表与老库迁移（含 baseline 版本补登）
+  auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表（含 admin_nonces）与老库迁移（含 baseline 版本补登）
   quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、幂等存档、撤销与低余额事件
   schemas.py    # Pydantic 请求/响应模型
-  main.py       # FastAPI 路由
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名）
 tests/
-  test_api.py   # 行为与并发测试
+  test_api.py   # 行为、并发与 HMAC 认证测试
 Dockerfile
 docker-compose.yml
 ```
