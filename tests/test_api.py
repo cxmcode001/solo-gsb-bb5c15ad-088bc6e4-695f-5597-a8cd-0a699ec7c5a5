@@ -2,24 +2,53 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 
+TEST_KEY_ID = "test-admin"
+TEST_SECRET = b"test-secret"
+
+
+def sign_headers(method: str, path: str, body: bytes, *,
+                 ts: int | None = None, nonce: str | None = None,
+                 key_id: str = TEST_KEY_ID, secret: bytes = TEST_SECRET) -> dict:
+    """按服务端规则生成四个认证头。path 为原始路径（可带查询串）。"""
+    import time
+
+    timestamp = int(time.time()) if ts is None else ts
+    nonce = nonce or uuid.uuid4().hex
+    body_sha = hashlib.sha256(body).hexdigest()
+    text = "\n".join([method, path, body_sha, str(timestamp), nonce])
+    signature = hmac.new(secret, text.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "X-Key-Id": key_id,
+        "X-Timestamp": str(timestamp),
+        "X-Nonce": nonce,
+        "X-Signature": signature,
+    }
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch) -> TestClient:
     db_file = tmp_path / "test.db"
     monkeypatch.setenv("QUOTA_DB_PATH", str(db_file))
+    monkeypatch.setenv("ADMIN_KEY_ID", TEST_KEY_ID)
+    monkeypatch.setenv("ADMIN_HMAC_SECRET", TEST_SECRET.decode("utf-8"))
     # 延迟导入 app，确保它读到环境变量
     import importlib
 
-    from app import database, main
+    from app import auth, database, main
 
     importlib.reload(database)
+    importlib.reload(auth)
     importlib.reload(main)
     database.init_db(str(db_file))
     with TestClient(main.app) as c:
@@ -27,6 +56,28 @@ def client(tmp_path, monkeypatch) -> TestClient:
 
 
 _UNSET = object()
+
+
+def admin_put_policies(client, body: dict, **sign_kw):
+    raw = __import__("json").dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    headers = sign_headers("PUT", "/policies", raw, **sign_kw)
+    return client.put("/policies", content=raw,
+                      headers={**headers, "Content-Type": "application/json"})
+
+
+def admin_post(client, path: str, body: dict, **sign_kw):
+    import json
+
+    raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+    headers = sign_headers("POST", path, raw, **sign_kw)
+    return client.post(path, content=raw,
+                       headers={**headers, "Content-Type": "application/json"})
+
+
+def admin_cancel(client, change_id: str, **sign_kw):
+    path = f"/policy-changes/{change_id}"
+    headers = sign_headers("DELETE", path, b"", **sign_kw)
+    return client.delete(path, headers=headers)
 
 
 def put_policy(client, scope, capacity, refill_rate, tenant=None, route=None,
@@ -40,7 +91,7 @@ def put_policy(client, scope, capacity, refill_rate, tenant=None, route=None,
     }
     if threshold is not _UNSET:
         body["low_balance_threshold"] = threshold
-    return client.put("/policies", json=body)
+    return admin_put_policies(client, body)
 
 
 def _iso(dt: datetime) -> str:
@@ -62,13 +113,14 @@ def post_change(client, change_id, scope, capacity, refill_rate, *,
     }
     if threshold is not _UNSET:
         body["low_balance_threshold"] = threshold
-    return client.post("/policy-changes", json=body)
+    return admin_post(client, "/policy-changes", body)
 
 
 def rollback(client, scope, version, tenant=None, route=None):
-    return client.post(
+    return admin_post(
+        client,
         "/policies/rollback",
-        json={
+        {
             "scope": scope,
             "tenant_id": tenant,
             "route_id": route,
@@ -554,10 +606,10 @@ def test_policy_change_lifecycle_and_conflicts(client):
     assert client.get("/policy-changes/missing").status_code == 404
 
     # 取消后：PUT 恢复、可再提交；重复取消幂等
-    r = client.delete("/policy-changes/ch1")
+    r = admin_cancel(client, "ch1")
     assert r.status_code == 200 and r.json()["status"] == "cancelled"
     assert r.json()["cancelled_at"]
-    assert client.delete("/policy-changes/ch1").json()["status"] == "cancelled"
+    assert admin_cancel(client, "ch1").json()["status"] == "cancelled"
     assert put_policy(client, "global", 200, 0).status_code == 200
     r = post_change(client, "ch1b", "global", 50, 10, effective_in=3600)
     assert r.status_code == 200
@@ -578,13 +630,13 @@ def test_policy_change_validation(client):
                     effective_in=10)
     assert r.status_code == 422
     # effective_at 必须是未来
-    r = client.post("/policy-changes", json={
+    r = admin_post(client, "/policy-changes", {
         "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
         "effective_at": _iso(datetime.now(timezone.utc) - timedelta(seconds=5)),
     })
     assert r.status_code == 422
     # effective_at 必须显式带时区
-    r = client.post("/policy-changes", json={
+    r = admin_post(client, "/policy-changes", {
         "change_id": "x", "scope": "global", "capacity": 10, "refill_rate": 0,
         "effective_at": "2026-10-01T00:00:00",
     })
@@ -626,7 +678,7 @@ def test_change_application_scales_balance_proportionally(client):
     # applied 后可以提交新的 pending，也可以直接 PUT
     assert post_change(client, "ch2", "global", 10, 0,
                        effective_in=3600).status_code == 200
-    assert client.delete("/policy-changes/ch2").status_code == 200
+    assert admin_cancel(client, "ch2").status_code == 200
     assert put_policy(client, "global", 50, 0).status_code == 200
 
 
@@ -789,17 +841,17 @@ def test_revoke_applies_due_change_before_refund(client):
 def test_cancel_after_effective_time_conflicts(client):
     put_policy(client, "global", 100, 0)
     post_change(client, "ch1", "global", 50, 0, effective_in=1)
-    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert admin_cancel(client, "ch1").status_code == 200
     # 取消后已无 pending，可以重新提交一条
     post_change(client, "ch2", "global", 50, 0, effective_in=1)
 
     import time
     time.sleep(1.2)
     # 到期后取消 -> 409；触发一次裁决令其应用
-    assert client.delete("/policy-changes/ch2").status_code == 409
+    assert admin_cancel(client, "ch2").status_code == 409
     client.post("/decide", json={"request_id": "d1", "cost": 1})
     assert client.get("/policy-changes/ch2").json()["status"] == "applied"
-    assert client.delete("/policy-changes/ch2").status_code == 409
+    assert admin_cancel(client, "ch2").status_code == 409
 
 
 # ------------------------------------------------------------ 策略版本审计与回滚
@@ -939,7 +991,7 @@ def test_rollblock_blocked_by_pending_change(client):
     assert p["capacity"] == 50.0
     assert [v["version"] for v in history(client, "global").json()] == [2, 1]
     # 取消后可以回滚
-    assert client.delete("/policy-changes/ch1").status_code == 200
+    assert admin_cancel(client, "ch1").status_code == 200
     assert rollback(client, "global", 1).status_code == 200
 
 
@@ -1060,3 +1112,192 @@ def test_policy_versions_are_append_only(tmp_path):
         assert [(r[0], r[1]) for r in rows] == [(1, 10.0), (2, 11.0)]
     finally:
         conn.close()
+
+
+# ----------------------------------------------------- 管理写接口 HMAC 防重放
+
+
+def test_admin_writes_require_auth_headers(client):
+    # 四个受保护接口：完全不带认证头 -> 401
+    assert client.put("/policies", json={"scope": "global", "capacity": 1,
+                                         "refill_rate": 0}).status_code == 401
+    assert client.post("/policies/rollback",
+                       json={"scope": "global", "version": 1}).status_code == 401
+    assert client.post("/policy-changes", json={
+        "change_id": "c", "scope": "global", "capacity": 1, "refill_rate": 0,
+        "effective_at": _iso(datetime.now(timezone.utc) + timedelta(hours=1)),
+    }).status_code == 401
+    assert client.delete("/policy-changes/c").status_code == 401
+
+
+def test_get_decide_and_revoke_remain_open(client):
+    # GET、裁决、撤销不鉴权，行为与之前一致
+    assert client.get("/health").status_code == 200
+    assert client.get("/policies").status_code == 200
+    assert client.get("/policy-changes").status_code == 200
+    assert client.get("/buckets").status_code == 200
+    assert client.get("/events").status_code == 200
+    # 无策略裁决 -> 404（而不是 401），证明没有鉴权拦截
+    assert client.post("/decide", json={"request_id": "d", "cost": 1}
+                       ).status_code == 404
+    assert client.post("/decide/nope/revoke").status_code == 404
+
+
+def test_valid_signature_succeeds(client):
+    r = put_policy(client, "global", 10, 0)
+    assert r.status_code == 200
+    assert r.json()["capacity"] == 10.0
+
+
+def test_bad_key_id_bad_signature_and_tampered_path_are_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    ct = {"Content-Type": "application/json"}
+    # 错误 key id
+    h = sign_headers("PUT", "/policies", body, key_id="wrong")
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 错误密钥
+    h = sign_headers("PUT", "/policies", body, secret=b"nope")
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 签名路径与实际路径不一致（防篡改路径/查询串）
+    h = sign_headers("PUT", "/policies?x=1", body)
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 篡改请求体：签名时用的 body 与发送的 body 不同
+    h = sign_headers("PUT", "/policies", b'{"scope":"global"}')
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 缺头
+    h = sign_headers("PUT", "/policies", body)
+    h.pop("X-Nonce")
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 非数字时间戳
+    h = sign_headers("PUT", "/policies", body)
+    h["X-Timestamp"] = "soon"
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    # 非 ASCII 畸形头值（HTTP obs-text 字节）不得触发 500
+    # （compare_digest 的 str 限制），服务端应安全返回 401
+    h = sign_headers("PUT", "/policies", body)
+    h["X-Signature"] = b"\xe9" * 64  # bytes 才能经 TestClient 发送 obs-text
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    h = sign_headers("PUT", "/policies", body)
+    h["X-Key-Id"] = b"k\xe9"
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+
+
+def test_timestamp_skew_outside_window_is_401(client):
+    body = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    ct = {"Content-Type": "application/json"}
+    now = int(datetime.now(timezone.utc).timestamp())
+    # 窗口内（299s）通过
+    h = sign_headers("PUT", "/policies", body, ts=now - 299)
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 200
+    # 超过 300s（过去 / 未来）-> 401
+    h = sign_headers("PUT", "/policies", body, ts=now - 301, nonce="n-past")
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+    h = sign_headers("PUT", "/policies", body, ts=now + 301, nonce="n-future")
+    assert client.put("/policies", content=body, headers={**h, **ct}).status_code == 401
+
+
+def test_nonce_reuse_returns_409_and_distinct_nonce_ok(client):
+    body1 = b'{"scope":"global","capacity":10,"refill_rate":0}'
+    body2 = b'{"scope":"global","capacity":20,"refill_rate":0}'
+    ct = {"Content-Type": "application/json"}
+    h1 = sign_headers("PUT", "/policies", body1, nonce="reuse-me")
+    assert client.put("/policies", content=body1, headers={**h1, **ct}).status_code == 200
+    # 用同一 nonce 重新签一个新请求（签名/时间戳都合法）-> 409
+    import time
+    h2 = sign_headers("PUT", "/policies", body2,
+                      nonce="reuse-me", ts=int(time.time()))
+    assert client.put("/policies", content=body2, headers={**h2, **ct}).status_code == 409
+    # 换一个 nonce 即可成功
+    h3 = sign_headers("PUT", "/policies", body2, nonce="fresh-nonce")
+    assert client.put("/policies", content=body2, headers={**h3, **ct}).status_code == 200
+
+
+def test_business_failure_does_not_consume_nonce(client):
+    ct = {"Content-Type": "application/json"}
+    # 目标策略不存在 -> 业务 404，nonce 不应被占用
+    change = (
+        b'{"change_id":"ch","scope":"global","capacity":1,"refill_rate":0,'
+        b'"effective_at":"'
+        + _iso(datetime.now(timezone.utc) + timedelta(hours=1)).encode()
+        + b'"}'
+    )
+    h = sign_headers("POST", "/policy-changes", change, nonce="nb-1")
+    assert client.post("/policy-changes", content=change,
+                       headers={**h, **ct}).status_code == 404
+    # 创建策略后用同一个 nonce 重试（重新签名）-> 成功，证明没有被占用
+    put_policy(client, "global", 10, 0)
+    h = sign_headers("POST", "/policy-changes", change, nonce="nb-1")
+    assert client.post("/policy-changes", content=change,
+                       headers={**h, **ct}).status_code == 200
+    # 业务 409（重复 change_id）同样不占用其 nonce
+    h = sign_headers("POST", "/policy-changes", change, nonce="nb-2")
+    assert client.post("/policy-changes", content=change,
+                       headers={**h, **ct}).status_code == 409
+    h = sign_headers("POST", "/policy-changes", change, nonce="nb-2")
+    assert client.post("/policy-changes", content=change,
+                       headers={**h, **ct}).status_code == 409
+
+
+def test_nonce_retained_300s_then_purged_and_reusable(tmp_path, monkeypatch):
+    """直接验证保留窗口：expires_at <= now 的行会在下次管理写事务中被清除。"""
+    db_file = tmp_path / "ttl.db"
+    monkeypatch.setenv("QUOTA_DB_PATH", str(db_file))
+    monkeypatch.setenv("ADMIN_KEY_ID", TEST_KEY_ID)
+    monkeypatch.setenv("ADMIN_HMAC_SECRET", TEST_SECRET.decode())
+    import importlib
+    from app import auth, database, main
+    importlib.reload(database)
+    importlib.reload(auth)
+    importlib.reload(main)
+    database.init_db(str(db_file))
+
+    conn = database.connect(str(db_file))
+    try:
+        # 手工写入一条“299 秒前登记”的 nonce：尚未到期
+        with database.write_tx(conn):
+            conn.execute(
+                "INSERT INTO admin_nonces (key_id, nonce, ts, seen_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (TEST_KEY_ID, "alive", 1000, 1000, 1300),
+            )
+        auth.purge_expired_nonces(conn, now=1299)
+        assert auth.count_nonces(conn, TEST_KEY_ID) == 1
+        # 到达 expires_at（保留满 300s）后被清除
+        auth.purge_expired_nonces(conn, now=1300)
+        assert auth.count_nonces(conn, TEST_KEY_ID) == 0
+    finally:
+        conn.close()
+
+
+def test_signature_binds_query_string(client):
+    put_policy(client, "global", 10, 0)
+    post_change(client, "chq", "global", 5, 0, effective_in=3600)
+    # 签名与请求都带同一查询串：通过认证（业务正常返回 200 取消）
+    h = sign_headers("DELETE", "/policy-changes/chq?dry_run=0", b"")
+    r = client.delete("/policy-changes/chq?dry_run=0", headers=h)
+    assert r.status_code == 200
+    # 签名带查询串、实际请求不带 -> 401（目标仍为已取消，重复取消本应 200，
+    # 因签名不匹配先被拦截，恰好可区分）
+    post_change(client, "chq2", "global", 5, 0, effective_in=3600)
+    h = sign_headers("DELETE", "/policy-changes/chq2?x=1", b"")
+    assert client.delete("/policy-changes/chq2", headers=h).status_code == 401
+    # 实际带查询串、签名时不带 -> 401
+    h = sign_headers("DELETE", "/policy-changes/chq2", b"")
+    assert client.delete("/policy-changes/chq2?x=1", headers=h).status_code == 401
+    # 正确签名 + 查询串 -> 200
+    h = sign_headers("DELETE", "/policy-changes/chq2?x=1", b"")
+    assert client.delete("/policy-changes/chq2?x=1", headers=h).status_code == 200
+
+
+def test_server_fails_to_start_without_admin_credentials(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUOTA_DB_PATH", str(tmp_path / "x.db"))
+    monkeypatch.delenv("ADMIN_KEY_ID", raising=False)
+    monkeypatch.delenv("ADMIN_HMAC_SECRET", raising=False)
+    import importlib
+    from app import auth, database, main
+    importlib.reload(database)
+    importlib.reload(auth)
+    importlib.reload(main)
+    with pytest.raises(RuntimeError):
+        with TestClient(main.app):
+            pass

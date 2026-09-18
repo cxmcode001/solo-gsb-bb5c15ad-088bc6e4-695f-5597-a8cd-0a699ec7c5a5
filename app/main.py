@@ -14,6 +14,7 @@ from typing import Iterator
 from fastapi import Depends, FastAPI, Query
 
 from . import quota
+from .auth import AdminAuth, admin_write_tx, check_admin_config, require_admin
 from .database import connect, init_db, write_tx
 from .schemas import (
     BucketOut,
@@ -32,6 +33,8 @@ from .schemas import (
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 管理写接口凭证缺失时快速失败，避免带鉴权的接口静默裸奔
+    check_admin_config()
     init_db()
     yield
 
@@ -45,8 +48,10 @@ app = FastAPI(
         "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
         "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用；"
         "策略变更追加不可变版本记录，支持历史查询与同事务回滚。"
+        "策略新增/更新、回滚、定时变更的创建/取消等管理写接口，"
+        "使用 HMAC-SHA256 + 时间戳 + nonce 的防重放认证。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -72,11 +77,21 @@ def get_policies(conn: sqlite3.Connection = Depends(get_conn)) -> list[dict]:
     return quota.list_policies(conn)
 
 
-@app.put("/policies", response_model=PolicyOut, tags=["策略"])
+@app.put(
+    "/policies",
+    response_model=PolicyOut,
+    tags=["策略"],
+    responses={
+        401: {"description": "缺少/无效的 HMAC 认证头，或时间戳偏离超过 300 秒"},
+        409: {"description": "nonce 重用；或该策略存在待生效（pending）的定时变更"},
+    },
+)
 def put_policy(
-    body: PolicyIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyIn,
+    auth: AdminAuth = Depends(require_admin),
+    conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
-    with write_tx(conn):
+    with admin_write_tx(conn, auth):
         return quota.upsert_policy(
             conn,
             scope=body.scope,
@@ -110,19 +125,23 @@ def get_policy_history(
     response_model=PolicyVersionOut,
     tags=["策略版本审计"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 认证头，或时间戳偏离超过 300 秒"},
         404: {"description": "目标策略或版本不存在"},
-        409: {"description": "该策略存在待生效（pending）的定时变更"},
+        409: {"description": "nonce 重用；或该策略存在待生效（pending）的定时变更"},
     },
 )
 def post_policy_rollback(
-    body: PolicyRollbackIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyRollbackIn,
+    auth: AdminAuth = Depends(require_admin),
+    conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
     """在同一写事务内把策略恢复到指定历史版本。
 
     已有桶先按当前策略补充到事务时刻，再按目标版本容量截断；
     恢复成功会追加一条 source=rollback 的新版本（版本号继续递增）。
+    需要 HMAC-SHA256 防重放认证（X-Key-Id / X-Timestamp / X-Nonce / X-Signature）。
     """
-    with write_tx(conn):
+    with admin_write_tx(conn, auth):
         return quota.rollback_policy(
             conn,
             scope=body.scope,
@@ -140,20 +159,24 @@ def post_policy_rollback(
     response_model=PolicyChangeOut,
     tags=["策略定时切换"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 认证头，或时间戳偏离超过 300 秒"},
         404: {"description": "目标策略不存在"},
-        409: {"description": "change_id 已存在，或同一策略已有待生效变更"},
+        409: {"description": "nonce 重用；或 change_id 已存在；或同一策略已有待生效变更"},
     },
 )
 def post_policy_change(
-    body: PolicyChangeIn, conn: sqlite3.Connection = Depends(get_conn)
+    body: PolicyChangeIn,
+    auth: AdminAuth = Depends(require_admin),
+    conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
     """为已存在的策略登记一条未来生效的定时切换。
 
     同一策略至多一条 pending 变更；存在 pending 期间 PUT /policies 更新该
     策略会返回 409。到期后无需后台任务：下一次命中该策略的裁决会在同一
     BEGIN IMMEDIATE 事务内先应用变更，再执行裁决。
+    需要 HMAC-SHA256 防重放认证（X-Key-Id / X-Timestamp / X-Nonce / X-Signature）。
     """
-    with write_tx(conn):
+    with admin_write_tx(conn, auth):
         return quota.create_policy_change(
             conn,
             change_id=body.change_id,
@@ -206,15 +229,22 @@ def get_policy_change(
     response_model=PolicyChangeOut,
     tags=["策略定时切换"],
     responses={
+        401: {"description": "缺少/无效的 HMAC 认证头，或时间戳偏离超过 300 秒"},
         404: {"description": "变更不存在"},
-        409: {"description": "变更已生效或已到生效时刻，无法取消"},
+        409: {"description": "nonce 重用；或变更已生效/已到生效时刻，无法取消"},
     },
 )
 def delete_policy_change(
-    change_id: str, conn: sqlite3.Connection = Depends(get_conn)
+    change_id: str,
+    auth: AdminAuth = Depends(require_admin),
+    conn: sqlite3.Connection = Depends(get_conn),
 ) -> dict:
-    """在生效前取消一条 pending 变更；重复取消幂等。"""
-    with write_tx(conn):
+    """在生效前取消一条 pending 变更；重复取消幂等。
+
+    需要 HMAC-SHA256 防重放认证（X-Key-Id / X-Timestamp / X-Nonce / X-Signature），
+    DELETE 请求的请求体为空，参与签名的体 SHA-256 为空串的哈希。
+    """
+    with admin_write_tx(conn, auth):
         return quota.cancel_policy_change(conn, change_id)
 
 

@@ -9,6 +9,12 @@ services:
       - quota-data:/data
     environment:
       QUOTA_DB_PATH: /data/quota.db
+      # 管理写接口（PUT /policies、POST /policies/rollback、
+      # POST/DELETE /policy-changes）的 HMAC-SHA256 防重放凭证。
+      # 以下为开箱即用的演示值；生产部署务必通过 .env / 环境变量覆盖：
+      #   echo 'ADMIN_HMAC_SECRET=$(openssl rand -hex 32)' >> .env
+      ADMIN_KEY_ID: ${ADMIN_KEY_ID:-admin-local}
+      ADMIN_HMAC_SECRET: ${ADMIN_HMAC_SECRET:-dev-only-change-me}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]

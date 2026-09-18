@@ -135,6 +135,23 @@ BEGIN
     SELECT RAISE(ABORT, 'policy_versions 为只追加的不可变审计表，禁止 DELETE');
 END;
 
+-- 管理写接口防重放：仅认证通过的请求会在「业务写入所在的同一个
+-- BEGIN IMMEDIATE 事务」内登记 nonce；业务失败回滚时登记一并撤销，
+-- 故业务失败不会占用 nonce。nonce 只保留 300 秒（与时间戳窗口一致），
+-- 到期行由后续管理写请求在事务内惰性清除。
+-- 同一 key_id 下 nonce 唯一：仍在保留期内重用返回 409。
+CREATE TABLE IF NOT EXISTS admin_nonces (
+    key_id     TEXT NOT NULL,
+    nonce      TEXT NOT NULL,
+    ts         INTEGER NOT NULL,   -- 客户端 X-Timestamp（Unix 秒）
+    seen_at    INTEGER NOT NULL,   -- 服务端登记时刻（Unix 秒）
+    expires_at INTEGER NOT NULL,   -- seen_at + 300
+    PRIMARY KEY (key_id, nonce)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_admin_nonces_expires_at
+ON admin_nonces (expires_at);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
